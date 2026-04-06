@@ -208,11 +208,13 @@ else
   COPYFILE_DISABLE=1 tar czf "$TARBALL" \
     -C "$SCRIPT_DIR/.." \
     enterprise/agent-container \
-    enterprise/exec-agent 2>/dev/null || \
+    enterprise/exec-agent \
+    enterprise/auth-agent 2>/dev/null || \
   tar czf "$TARBALL" \
     -C "$SCRIPT_DIR/.." \
     enterprise/agent-container \
-    enterprise/exec-agent
+    enterprise/exec-agent \
+    enterprise/auth-agent
   aws s3 cp "$TARBALL" "s3://${S3_BUCKET}/_build/agent-build.tar.gz" \
     --region "$REGION" --quiet
   rm -f "$TARBALL"
@@ -233,7 +235,7 @@ else
       \"aws s3 cp s3://${S3_BUCKET}/_build/agent-build.tar.gz . --region ${REGION}\",
       \"tar xzf agent-build.tar.gz\",
       \"aws ecr get-login-password --region ${REGION} | docker login --username AWS --password-stdin \${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com\",
-      \"docker build -f enterprise/agent-container/Dockerfile -t \${ECR_URI}:latest .\",
+      \"docker build -f enterprise/agent-container/Dockerfile -t \${ECR_URI}:latest enterprise/\",
       \"docker push \${ECR_URI}:latest\",
       \"echo BUILD_AND_PUSH_COMPLETE\"
     ]" \
