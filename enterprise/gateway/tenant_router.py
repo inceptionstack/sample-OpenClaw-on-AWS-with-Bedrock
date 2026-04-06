@@ -200,6 +200,8 @@ _CHANNEL_ALIASES = {
     "imessage": "im",
     "googlechat": "gc",
     "webchat": "web",
+    "playground": "pgnd",
+    "twin": "twin",
 }
 
 
@@ -223,9 +225,8 @@ def derive_tenant_id(channel: str, user_id: str) -> str:
     sanitized = re.sub(r"[^a-zA-Z0-9_.\-]", "_", user_id.strip())
 
     # Hash suffix ensures minimum 33 chars for AgentCore runtimeSessionId
-    # 19 hex chars ensures even short channel+user combos reach 33+ chars
-    from datetime import date as _d
-    hash_suffix = hashlib.sha256(f"{channel}:{user_id}:{_d.today().strftime('%Y%m%d')}".encode()).hexdigest()[:19]
+    # Stable across days — Session Storage persists across stop/resume cycles
+    hash_suffix = hashlib.sha256(f"{channel}:{user_id}".encode()).hexdigest()[:19]
     tenant_id = f"{channel_short}__{sanitized}__{hash_suffix}"
 
     # Pad to 33 chars minimum if still too short
@@ -480,6 +481,8 @@ class TenantRouterHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/route":
             self._handle_route()
+        elif self.path == "/stop-session":
+            self._handle_stop_session()
         else:
             self._respond(404, {"error": "not found"})
 
@@ -509,12 +512,16 @@ class TenantRouterHandler(BaseHTTPRequestHandler):
 
         try:
             if resolved_emp_id:
-                # Employee-scoped session: all channels for the same employee share ONE
-                # AgentCore session, just like standard OpenClaw Gateway manages multiple
-                # channels in a single process. This eliminates cross-channel MEMORY.md
-                # write conflicts and preserves natural cross-channel context — no changes
-                # to OpenClaw required.
-                tenant_id = derive_tenant_id("emp", resolved_emp_id)
+                # Twin and Playground get isolated sessions so they don't pollute
+                # the employee's real conversation history. workspace_assembler.py
+                # and server.py detect these prefixes (twin__, pgnd__) to inject
+                # mode-specific context (e.g. digital twin persona, read-only notice).
+                if channel in ("twin", "playground"):
+                    tenant_id = derive_tenant_id(channel, resolved_emp_id)
+                else:
+                    # Employee-scoped session: all IM channels + Portal share ONE
+                    # AgentCore session, preserving cross-channel context.
+                    tenant_id = derive_tenant_id("emp", resolved_emp_id)
             else:
                 # Fallback for users not yet in DynamoDB user-mapping (e.g. new users
                 # before pairing, or admin test accounts).
@@ -540,6 +547,63 @@ class TenantRouterHandler(BaseHTTPRequestHandler):
             })
         except RuntimeError as e:
             self._respond(502, {"error": str(e), "tenant_id": tenant_id})
+
+    def _handle_stop_session(self):
+        """Stop an AgentCore session to force workspace refresh on next invoke.
+        Used by Admin Console after config changes (USER.md, permissions, model override).
+        POST /stop-session { "emp_id": "emp-carol" }
+        """
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            self._respond(400, {"error": "invalid json"})
+            return
+
+        emp_id = payload.get("emp_id", "")
+        if not emp_id:
+            self._respond(400, {"error": "emp_id required"})
+            return
+
+        stopped = []
+        errors = []
+
+        # Stop all session types for this employee (emp, twin, pgnd)
+        for channel in ["emp", "twin", "playground"]:
+            try:
+                session_id = derive_tenant_id(channel, emp_id)
+                # Resolve the runtime for this employee
+                effective_runtime = _get_runtime_id_for_tenant(emp_id) or RUNTIME_ID
+                if not effective_runtime:
+                    continue
+
+                try:
+                    import boto3 as _b3stop
+                    sts = _b3stop.client("sts", region_name=AWS_REGION)
+                    account_id = sts.get_caller_identity()["Account"]
+                    runtime_arn = f"arn:aws:bedrock-agentcore:{AWS_REGION}:{account_id}:runtime/{effective_runtime}"
+
+                    client = _agentcore_client()
+                    client.stop_runtime_session(
+                        agentRuntimeArn=runtime_arn,
+                        runtimeSessionId=session_id,
+                    )
+                    stopped.append(session_id)
+                    logger.info("Stopped session %s for %s", session_id, emp_id)
+                except Exception as e:
+                    # Session may not exist — that's fine
+                    err_code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+                    if err_code not in ("ResourceNotFoundException", "ValidationException"):
+                        errors.append(f"{channel}: {e}")
+                    logger.debug("Stop session %s: %s", session_id, e)
+            except Exception as e:
+                errors.append(f"{channel}: {e}")
+
+        self._respond(200, {
+            "emp_id": emp_id,
+            "stopped": stopped,
+            "errors": errors,
+        })
 
     def _respond(self, status: int, body: dict):
         data = json.dumps(body, default=str).encode()
